@@ -31,8 +31,10 @@ func main() {
 
 	// Flags
 	streamFlag := flag.Bool("stream", false, "Stream GitHub events")
+	userInfoFlag := flag.Bool("userinfo", false, "Fetch GitHub user information (requires more API calls)")
 	orgFlag := flag.String("org", "", "GitHub organization to list members")
 	outDir := flag.String("out", ".", "Output directory for JSON files")
+
 	flag.Parse()
 
 	// Create output directory if it doesn't exist
@@ -47,15 +49,19 @@ func main() {
 	client := github.NewClient(tc)
 
 	if *orgFlag != "" {
-		listOrgMembers(ctx, client, *orgFlag, *outDir)
+		listOrgMembers(ctx, client, *orgFlag, *outDir, *userInfoFlag)
 	}
 
 	if *streamFlag {
-		streamEvents(ctx, client, *outDir)
+		for {
+			streamEvents(ctx, client, *outDir, *userInfoFlag)
+			log.Printf("resting ...")
+			time.Sleep(1 * time.Second)
+		}
 	}
 }
 
-func listOrgMembers(ctx context.Context, client *github.Client, org string, outDir string) {
+func listOrgMembers(ctx context.Context, client *github.Client, org string, outDir string, fetchUser bool) {
 	opts := &github.ListMembersOptions{}
 	for {
 		members, resp, err := client.Organizations.ListMembers(ctx, org, opts)
@@ -64,7 +70,7 @@ func listOrgMembers(ctx context.Context, client *github.Client, org string, outD
 		}
 
 		for _, member := range members {
-			processUser(ctx, client, member.GetLogin(), org, outDir)
+			processUser(ctx, client, member.GetLogin(), org, outDir, fetchUser)
 		}
 
 		if resp.NextPage == 0 {
@@ -74,31 +80,34 @@ func listOrgMembers(ctx context.Context, client *github.Client, org string, outD
 	}
 }
 
-func streamEvents(ctx context.Context, client *github.Client, outDir string) {
+func streamEvents(ctx context.Context, client *github.Client, outDir string, fetchUser bool) {
 	opts := &github.ListOptions{PerPage: 100}
+	seen := map[string]bool{}
 	for {
-		// effectively a 100-row cache
-		seen := map[string]bool{}
 		events, resp, err := client.Activity.ListEvents(ctx, opts)
 		if err != nil {
 			if _, ok := err.(*github.RateLimitError); ok {
-				log.Println("Rate limit hit. Sleeping for an hour.")
-				time.Sleep(time.Hour)
+				log.Println("Rate limit hit. Sleeping for 20 minutes.")
+				time.Sleep(20 * time.Minute)
 				continue
+
 			}
 			log.Fatalf("Failed to list events: %v", err)
 		}
 
+		log.Printf("processing %d events ...", len(events))
 		for _, event := range events {
 			if event.GetActor() == nil {
 				continue
 			}
 
+			// log.Printf("kind: %s", event.GetType())
 			login := event.GetActor().GetLogin()
 			if seen[login] {
 				continue
 			}
-			processUser(ctx, client, event.Actor.GetLogin(), event.GetRepo().GetName(), outDir)
+			time.Sleep(50 * time.Millisecond)
+			processUser(ctx, client, event.Actor.GetLogin(), event.GetRepo().GetName(), outDir, fetchUser)
 			seen[login] = true
 		}
 
@@ -108,18 +117,33 @@ func streamEvents(ctx context.Context, client *github.Client, outDir string) {
 		opts.Page = resp.NextPage
 
 		// Optional: Sleep between requests to avoid rate limiting
-		time.Sleep(5 * time.Second)
+		log.Printf("sleep before page %d", opts.Page)
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
-func processUser(ctx context.Context, client *github.Client, username string, repo string, outDir string) {
+func processUser(ctx context.Context, client *github.Client, username string, repo string, outDir string, fetchUser bool) {
+	if username == "" {
+		return
+	}
+	subdir := username
+	if len(username) > 2 {
+		subdir = strings.ToLower(username[0:2])
+	}
+
 	// Check if user file already exists
-	filePath := filepath.Join(outDir, username+".json")
-	if _, err := os.Stat(filePath); err == nil {
+	path := filepath.Join(outDir, subdir, username+".json")
+	if _, err := os.Stat(path); err == nil {
+		//		log.Printf("exists: %s", username)
 		return // File exists, skip processing
 	}
 
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		log.Printf("mkdir failed: %v", err)
+	}
+
 	// Fetch public keys
+	// log.Printf("Fetching keys for %s ...", username)
 	publicKeys, err := fetchPublicKeys(username)
 	if err != nil {
 		//		log.Printf("Failed to fetch public keys for %s: %v", username, err)
@@ -127,15 +151,23 @@ func processUser(ctx context.Context, client *github.Client, username string, re
 	}
 
 	// Fetch u details
-	u, _, err := client.Users.Get(ctx, username)
-	if err != nil {
-		log.Printf("Failed to get user details for %s: %v", username, err)
-		time.Sleep(15 * time.Second)
-		return
-	}
+	// log.Printf("Fetching info for %s ...", username)
+	var u *github.User
+	if fetchUser {
+		u, _, err := client.Users.Get(ctx, username)
+		if err != nil {
+			log.Printf("Failed to get user details for %s: %v", username, err)
+			time.Sleep(15 * time.Second)
+			return
+		}
 
-	if u.GetType() == "Bot" {
-		return
+		if u.GetType() == "Bot" {
+			return
+		}
+	} else {
+		if strings.HasSuffix(username, "bot") || strings.HasSuffix(username, "bot]") {
+			return
+		}
 	}
 
 	userInfo := UserInfo{
@@ -153,7 +185,7 @@ func processUser(ctx context.Context, client *github.Client, username string, re
 		return
 	}
 
-	if err := os.WriteFile(filePath, jsonData, 0o644); err != nil {
+	if err := os.WriteFile(path, jsonData, 0o644); err != nil {
 		log.Printf("Failed to write user file for %s: %v", username, err)
 	}
 }
@@ -178,6 +210,6 @@ func fetchPublicKeys(username string) ([]string, error) {
 	if len(body) == 0 {
 		return nil, nil
 	}
-	keys = strings.Split(string(body), "\n")
+	keys = strings.Split(strings.TrimSpace(string(body)), "\n")
 	return keys, nil
 }
