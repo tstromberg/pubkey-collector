@@ -30,10 +30,10 @@ func main() {
 	}
 
 	// Flags
-	streamFlag := flag.Bool("stream", false, "Stream GitHub events")
-	userInfoFlag := flag.Bool("userinfo", false, "Fetch GitHub user information (requires more API calls)")
-	orgFlag := flag.String("org", "", "GitHub organization to list members")
-	outDir := flag.String("out", ".", "Output directory for JSON files")
+	streamFlag := flag.Bool("stream", false, "Gather active users from GitHub events steam (loops infinitely)")
+	userInfoFlag := flag.Bool("userinfo", false, "Include GitHub user information (requires substantially more API calls)")
+	orgFlag := flag.String("org", "", "GitHub organization to gather keys from")
+	outDir := flag.String("out", "out/", "Output directory for JSON files")
 
 	flag.Parse()
 
@@ -63,6 +63,7 @@ func main() {
 
 func listOrgMembers(ctx context.Context, client *github.Client, org string, outDir string, fetchUser bool) {
 	opts := &github.ListMembersOptions{}
+	log.Printf("listing members of %s ...", org)
 	for {
 		members, resp, err := client.Organizations.ListMembers(ctx, org, opts)
 		if err != nil {
